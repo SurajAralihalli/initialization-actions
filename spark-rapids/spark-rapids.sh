@@ -192,7 +192,7 @@ function install_nvidia_gpu_driver() {
     # we need to install additional modules with enabling secure boot, see issue: https://github.com/GoogleCloudDataproc/initialization-actions/issues/1043
     # following [guide](https://cloud.google.com/compute/docs/gpus/install-drivers-gpu#secure-boot) for detailed information.
     if [[ ${SECURE_BOOT} == enabled ]]; then
-      NVIDIA_DRIVER_VERSION=$(apt-cache search 'linux-modules-nvidia-[0-9]+-gcp$' | awk '{print $1}' | sort | tail -n 1 | head -n 1 | awk -F"-" '{print $4}')
+      NVIDIA_DRIVER_VERSION=$(apt-cache search 'linux-modules-nvidia-[0-9]+-gcp$' | awk '{print $1}' | sort | tail -n 2 | head -n 1 | awk -F"-" '{print $4}')
       apt install linux-modules-nvidia-${NVIDIA_DRIVER_VERSION}-gcp -y
       apt install nvidia-driver-${NVIDIA_DRIVER_VERSION} -y
       
