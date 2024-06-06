@@ -246,7 +246,10 @@ function install_nvidia_gpu_driver() {
     setup_systemd_update_headers
 
   elif [[ ${OS_NAME} == "rocky" ]]; then
-
+    
+    # Ensure the Correct Kernel Development Packages are Installed
+    execute_with_retries "yum install -y kernel-devel-$(uname -r) kernel-headers-$(uname -r)"
+    
     ROCKY_VERSION=$(lsb_release -r | awk '{print $2}') # 8.8 or 9.1
     ROCKY_VERSION=${ROCKY_VERSION%.*} # 8 or 9
 
