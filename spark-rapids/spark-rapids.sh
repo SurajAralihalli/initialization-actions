@@ -101,7 +101,7 @@ function get_latest_rapids_version() {
 
 function get_latest_xgboost_version() {
   local -r scala_ver=$1
-  local -r metadata_url="https://repo.maven.apache.org/maven2/ml/dmlc/xgboost4j-spark-gpu_${scala_ver}/maven-metadata.xml"
+  local -r metadata_url="https://repo.maven.apache.org/maven2/ml/dmlc/xgboost4j-gpu_${scala_ver}/maven-metadata.xml"
   wget -nv -O- "${metadata_url}" 2>/dev/null | sed -n 's/.*<release>\(.*\)<\/release>.*/\1/p'
 }
 
