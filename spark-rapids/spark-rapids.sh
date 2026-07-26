@@ -980,17 +980,30 @@ function audit_environment() {
 
   AUDIT_SPARK_RAPIDS_JAR="NOT_INSTALLED"
   AUDIT_SPARK_RAPIDS_JAR_FILE=""
+  AUDIT_SPARK_RAPIDS_VER="none"
   if compgen -G "/usr/lib/spark/jars/rapids-4-spark_*.jar" > /dev/null; then
     AUDIT_SPARK_RAPIDS_JAR="INSTALLED"
     AUDIT_SPARK_RAPIDS_JAR_FILE=$(compgen -G "/usr/lib/spark/jars/rapids-4-spark_*.jar" | head -n1)
+    basename=$(basename "${AUDIT_SPARK_RAPIDS_JAR_FILE}")
+    version_part=${basename#*_}
+    version_part=${version_part%.jar}
+    AUDIT_SPARK_RAPIDS_VER=${version_part#*-}
+    AUDIT_SPARK_RAPIDS_VER=${AUDIT_SPARK_RAPIDS_VER%-cuda12}
   fi
-  export AUDIT_SPARK_RAPIDS_JAR AUDIT_SPARK_RAPIDS_JAR_FILE
+  export AUDIT_SPARK_RAPIDS_JAR AUDIT_SPARK_RAPIDS_JAR_FILE AUDIT_SPARK_RAPIDS_VER
 
   AUDIT_XGBOOST_JAR="NOT_INSTALLED"
+  AUDIT_XGBOOST_JAR_FILE=""
+  AUDIT_XGBOOST_VER="none"
   if compgen -G "/usr/lib/spark/jars/xgboost4j-spark-gpu_*.jar" > /dev/null; then
     AUDIT_XGBOOST_JAR="INSTALLED"
+    AUDIT_XGBOOST_JAR_FILE=$(compgen -G "/usr/lib/spark/jars/xgboost4j-spark-gpu_*.jar" | head -n1)
+    basename=$(basename "${AUDIT_XGBOOST_JAR_FILE}")
+    version_part=${basename#*_}
+    version_part=${version_part%.jar}
+    AUDIT_XGBOOST_VER=${version_part#*-}
   fi
-  export AUDIT_XGBOOST_JAR
+  export AUDIT_XGBOOST_JAR AUDIT_XGBOOST_JAR_FILE AUDIT_XGBOOST_VER
 
   AUDIT_YARN_GPU_CONFIG="NOT_CONFIGURED"
   if [[ -f "${HADOOP_CONF_DIR}/yarn-site.xml" ]] && grep -q "yarn.io/gpu" "${HADOOP_CONF_DIR}/yarn-site.xml" 2>/dev/null; then
@@ -1007,8 +1020,8 @@ function audit_environment() {
   echo "- GPU Hardware: ${AUDIT_GPU_HARDWARE}"
   echo "- NVIDIA Driver: ${AUDIT_NVIDIA_DRIVER} (${AUDIT_NVIDIA_DRIVER_VER})"
   echo "- CUDA Toolkit: ${AUDIT_CUDA_TOOLKIT} (${AUDIT_CUDA_VER})"
-  echo "- Spark RAPIDS JAR: ${AUDIT_SPARK_RAPIDS_JAR} (${AUDIT_SPARK_RAPIDS_JAR_FILE:-none})"
-  echo "- XGBoost GPU JAR: ${AUDIT_XGBOOST_JAR}"
+  echo "- Spark RAPIDS JAR: ${AUDIT_SPARK_RAPIDS_JAR} (Ver: ${AUDIT_SPARK_RAPIDS_VER}, File: ${AUDIT_SPARK_RAPIDS_JAR_FILE:-none})"
+  echo "- XGBoost GPU JAR: ${AUDIT_XGBOOST_JAR} (Ver: ${AUDIT_XGBOOST_VER})"
   echo "- YARN GPU Config: ${AUDIT_YARN_GPU_CONFIG}"
   echo "- GPU Monitoring Agent: ${AUDIT_GPU_AGENT}"
   echo "-----------------------------------"
@@ -1027,18 +1040,29 @@ function plan_installation() {
     echo "- Skip NVIDIA Driver & CUDA Toolkit installation (Driver: ${AUDIT_NVIDIA_DRIVER}, CUDA: ${AUDIT_CUDA_TOOLKIT})"
   fi
 
-  # Spark RAPIDS JAR needed if missing
-  if [[ "${AUDIT_SPARK_RAPIDS_JAR}" != "INSTALLED" ]]; then
-    PLAN_ACTIONS+=("INSTALL_SPARK_RAPIDS_JAR")
+  # Spark RAPIDS and XGBoost JARs needed if missing or wrong version
+  local need_rapids_update=0
+  local need_xgboost_update=0
+
+  if [[ "${AUDIT_SPARK_RAPIDS_JAR}" != "INSTALLED" ]] || [[ "${AUDIT_SPARK_RAPIDS_VER}" != "${SPARK_RAPIDS_VERSION}" ]]; then
+    need_rapids_update=1
+    echo "- RAPIDS JAR update needed: Installed=${AUDIT_SPARK_RAPIDS_VER}, Target=${SPARK_RAPIDS_VERSION}"
   fi
 
-  # XGBoost GPU JAR needed if missing (Assuming it's installed alongside RAPIDS in original)
-  # In original script, install_spark_rapids downloads both RAPIDS and XGBoost jars.
-  # Let's verify if we need separate actions or keep it as per original flow.
-  # The backup branch split them. Let's see if we can keep it simple first.
-  # If we look at original install_spark_rapids, it does both.
-  # Let's stick to original flow for now to be "incremental" and less disruptive.
-  # So INSTALL_SPARK_RAPIDS_JAR covers both in original script.
+  if [[ "${AUDIT_XGBOOST_JAR}" != "INSTALLED" ]] || [[ "${AUDIT_XGBOOST_VER}" != "${XGBOOST_VERSION}" ]]; then
+    need_xgboost_update=1
+    echo "- XGBoost JAR update needed: Installed=${AUDIT_XGBOOST_VER}, Target=${XGBOOST_VERSION}"
+  fi
+
+  if [[ ${need_rapids_update} -eq 1 ]] || [[ ${need_xgboost_update} -eq 1 ]]; then
+    if [[ "${AUDIT_SPARK_RAPIDS_JAR}" == "INSTALLED" ]] || [[ "${AUDIT_XGBOOST_JAR}" == "INSTALLED" ]]; then
+      PLAN_ACTIONS+=("REPLACE_SPARK_RAPIDS_AND_XGBOOST_JARS")
+    else
+      PLAN_ACTIONS+=("INSTALL_SPARK_RAPIDS_AND_XGBOOST_JARS")
+    fi
+  else
+    echo "- Skip RAPIDS & XGBoost JAR installation (Up to date)"
+  fi
 
   # YARN GPU configuration needed if missing
   if [[ "${AUDIT_YARN_GPU_CONFIG}" != "CONFIGURED" ]]; then
@@ -1067,8 +1091,14 @@ function execute_plan() {
         echo "Executing: INSTALL_NVIDIA_DRIVER"
         install_nvidia_gpu_driver
         ;;
-      INSTALL_SPARK_RAPIDS_JAR)
-        echo "Executing: INSTALL_SPARK_RAPIDS_JAR"
+      INSTALL_SPARK_RAPIDS_AND_XGBOOST_JARS)
+        echo "Executing: INSTALL_SPARK_RAPIDS_AND_XGBOOST_JARS"
+        install_spark_rapids
+        ;;
+      REPLACE_SPARK_RAPIDS_AND_XGBOOST_JARS)
+        echo "Executing: REPLACE_SPARK_RAPIDS_AND_XGBOOST_JARS"
+        rm -f /usr/lib/spark/jars/rapids-4-spark_*.jar
+        rm -f /usr/lib/spark/jars/xgboost4j-*.jar
         install_spark_rapids
         ;;
       CONFIGURE_YARN_GPU)
