@@ -93,6 +93,18 @@ function get_metadata_attribute() {
   /usr/share/google/get_metadata_value "attributes/${attribute_name}" || echo -n "${default_value}"
 }
 
+function get_latest_rapids_version() {
+  local -r scala_ver=$1
+  local -r metadata_url="https://repo1.maven.org/maven2/com/nvidia/rapids-4-spark_${scala_ver}/maven-metadata.xml"
+  wget -nv -O- "${metadata_url}" 2>/dev/null | sed -n 's/.*<release>\(.*\)<\/release>.*/\1/p'
+}
+
+function get_latest_xgboost_version() {
+  local -r scala_ver=$1
+  local -r metadata_url="https://repo.maven.apache.org/maven2/ml/dmlc/xgboost4j-spark-gpu_${scala_ver}/maven-metadata.xml"
+  wget -nv -O- "${metadata_url}" 2>/dev/null | sed -n 's/.*<release>\(.*\)<\/release>.*/\1/p'
+}
+
 CA_TMPDIR="$(mktemp -u -d -p /run/tmp -t ca_dir-XXXX)"
 PSN="$(get_metadata_attribute private_secret_name)"
 readonly PSN
@@ -226,9 +238,44 @@ else
 fi
 
 # Update SPARK RAPIDS config
-readonly DEFAULT_SPARK_RAPIDS_VERSION="26.06.0"
-readonly SPARK_RAPIDS_VERSION=$(get_metadata_attribute 'spark-rapids-version' ${DEFAULT_SPARK_RAPIDS_VERSION})
-readonly XGBOOST_VERSION=$(get_metadata_attribute 'xgboost-version' ${DEFAULT_XGBOOST_VERSION})
+readonly HARDCODED_RAPIDS_VERSION="26.06.0"
+
+# 1. Try to get explicit version from GCE Metadata
+SPARK_RAPIDS_VERSION=$(get_metadata_attribute 'spark-rapids-version' '')
+XGBOOST_VERSION=$(get_metadata_attribute 'xgboost-version' '')
+
+# 2. If not specified, try to auto-detect latest from Maven
+if [[ -z "${SPARK_RAPIDS_VERSION}" ]]; then
+  echo "INFO: spark-rapids-version not specified in metadata. Attempting to detect latest version..." >&2
+  LATEST_RAPIDS=$(get_latest_rapids_version "${SCALA_VERSION}")
+  if [[ -n "${LATEST_RAPIDS}" ]]; then
+    SPARK_RAPIDS_VERSION="${LATEST_RAPIDS}"
+    echo "INFO: Auto-detected latest RAPIDS version: ${SPARK_RAPIDS_VERSION}" >&2
+  fi
+fi
+
+if [[ -z "${XGBOOST_VERSION}" ]]; then
+  echo "INFO: xgboost-version not specified in metadata. Attempting to detect latest version..." >&2
+  LATEST_XGBOOST=$(get_latest_xgboost_version "${SCALA_VERSION}")
+  if [[ -n "${LATEST_XGBOOST}" ]]; then
+    XGBOOST_VERSION="${LATEST_XGBOOST}"
+    echo "INFO: Auto-detected latest XGBoost version: ${XGBOOST_VERSION}" >&2
+  fi
+fi
+
+# 3. If auto-detection failed (e.g. no internet), fall back to hardcoded default
+if [[ -z "${SPARK_RAPIDS_VERSION}" ]]; then
+  SPARK_RAPIDS_VERSION="${HARDCODED_RAPIDS_VERSION}"
+  echo "INFO: Auto-detection failed or skipped. Using hardcoded fallback for RAPIDS: ${SPARK_RAPIDS_VERSION}" >&2
+fi
+
+if [[ -z "${XGBOOST_VERSION}" ]]; then
+  XGBOOST_VERSION="${DEFAULT_XGBOOST_VERSION}"
+  echo "INFO: Auto-detection failed or skipped. Using hardcoded default for XGBoost: ${XGBOOST_VERSION}" >&2
+fi
+
+readonly SPARK_RAPIDS_VERSION
+readonly XGBOOST_VERSION
 
 # Fetch instance roles and runtime
 readonly ROLE=$(/usr/share/google/get_metadata_value attributes/dataproc-role)
