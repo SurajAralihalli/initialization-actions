@@ -295,6 +295,21 @@ NVIDIA_SMI_PATH='/usr/bin'
 MIG_MAJOR_CAPS=0
 IS_MIG_ENABLED=0
 
+function get_sysfs_gpu_count() {
+  local count=0
+  for dev in /sys/bus/pci/devices/*; do
+    if [[ -f "${dev}/vendor" ]] && [[ "$(cat "${dev}/vendor")" == "0x10de" ]]; then
+      if [[ -f "${dev}/class" ]]; then
+        local class_code=$(cat "${dev}/class")
+        if [[ "${class_code:0:4}" == "0x03" ]]; then
+          count=$((count + 1))
+        fi
+      fi
+    fi
+  done
+  echo $count
+}
+
 function execute_with_retries() {
   local -r cmd=$1
   for ((i = 0; i < 10; i++)); do
@@ -849,7 +864,7 @@ function setup_gpu_yarn() {
     fi
 
     # if mig is enabled drivers would have already been installed
-    if [[ $IS_MIG_ENABLED -eq 0 ]]; then
+    if [[ $IS_MIG_ENABLED -eq 0 ]] && ! command -v nvidia-smi &>/dev/null; then
       install_nvidia_gpu_driver
 
       #Install GPU metrics collection in Stackdriver if needed
@@ -900,7 +915,7 @@ function check_os_and_secure_boot() {
   if [[ "${SECURE_BOOT}" == "enabled" && $(echo "${DATAPROC_IMAGE_VERSION} <= 2.1" | bc -l) == 1 ]]; then
     echo "Error: Secure Boot is not supported before image 2.2. Please disable Secure Boot while creating the cluster."
     exit 1
-  elif [[ "${SECURE_BOOT}" == "enabled" ]] && [[ -z "${PSN}" ]]; then
+  elif [[ "${SECURE_BOOT}" == "enabled" ]] && [[ -z "${PSN}" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
       echo "Secure boot is enabled, but no signing material provided."
       echo "Please either disable secure boot or provide signing material as per"
       echo "https://github.com/GoogleCloudDataproc/custom-images/tree/master/examples/secure-boot"
@@ -930,26 +945,158 @@ function remove_old_backports {
 }
 
 
+function audit_environment() {
+  echo "=== Phase 1: Audit Environment ==="
+
+  AUDIT_GPU_HARDWARE="ABSENT"
+  if lspci 2>/dev/null | grep -q NVIDIA || [[ $(get_sysfs_gpu_count 2>/dev/null || echo 0) -gt 0 ]]; then
+    AUDIT_GPU_HARDWARE="PRESENT"
+  fi
+  export AUDIT_GPU_HARDWARE
+
+  AUDIT_NVIDIA_DRIVER="NOT_INSTALLED"
+  AUDIT_NVIDIA_DRIVER_VER="none"
+  if command -v nvidia-smi > /dev/null; then
+    AUDIT_NVIDIA_DRIVER="INSTALLED"
+    AUDIT_NVIDIA_DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || echo "unknown")
+  elif [[ -f /proc/driver/nvidia/version ]]; then
+     AUDIT_NVIDIA_DRIVER="INSTALLED"
+     AUDIT_NVIDIA_DRIVER_VER=$(awk '/Module Version/ {print $3}' /proc/driver/nvidia/version || echo "unknown")
+  fi
+  export AUDIT_NVIDIA_DRIVER AUDIT_NVIDIA_DRIVER_VER
+
+  AUDIT_CUDA_TOOLKIT="NOT_INSTALLED"
+  AUDIT_CUDA_VER="none"
+  if command -v nvcc > /dev/null; then
+    AUDIT_CUDA_TOOLKIT="INSTALLED"
+    AUDIT_CUDA_VER=$(nvcc --version | sed -n 's/.*release \([0-9.]\+\).*/\1/p' || echo "unknown")
+  elif [[ -d /usr/local/cuda ]]; then
+    AUDIT_CUDA_TOOLKIT="INSTALLED"
+    if [[ -f /usr/local/cuda/version.txt ]]; then
+       AUDIT_CUDA_VER=$(cat /usr/local/cuda/version.txt | awk '{print $3}' || echo "unknown")
+    fi
+  fi
+  export AUDIT_CUDA_TOOLKIT AUDIT_CUDA_VER
+
+  AUDIT_SPARK_RAPIDS_JAR="NOT_INSTALLED"
+  AUDIT_SPARK_RAPIDS_JAR_FILE=""
+  if compgen -G "/usr/lib/spark/jars/rapids-4-spark_*.jar" > /dev/null; then
+    AUDIT_SPARK_RAPIDS_JAR="INSTALLED"
+    AUDIT_SPARK_RAPIDS_JAR_FILE=$(compgen -G "/usr/lib/spark/jars/rapids-4-spark_*.jar" | head -n1)
+  fi
+  export AUDIT_SPARK_RAPIDS_JAR AUDIT_SPARK_RAPIDS_JAR_FILE
+
+  AUDIT_XGBOOST_JAR="NOT_INSTALLED"
+  if compgen -G "/usr/lib/spark/jars/xgboost4j-spark-gpu_*.jar" > /dev/null; then
+    AUDIT_XGBOOST_JAR="INSTALLED"
+  fi
+  export AUDIT_XGBOOST_JAR
+
+  AUDIT_YARN_GPU_CONFIG="NOT_CONFIGURED"
+  if [[ -f "${HADOOP_CONF_DIR}/yarn-site.xml" ]] && grep -q "yarn.io/gpu" "${HADOOP_CONF_DIR}/yarn-site.xml" 2>/dev/null; then
+    AUDIT_YARN_GPU_CONFIG="CONFIGURED"
+  fi
+  export AUDIT_YARN_GPU_CONFIG
+
+  AUDIT_GPU_AGENT="NOT_INSTALLED"
+  if systemctl is-active --quiet google_gpu_monitoring_agent_venv.service 2>/dev/null; then
+    AUDIT_GPU_AGENT="ACTIVE"
+  fi
+  export AUDIT_GPU_AGENT
+
+  echo "- GPU Hardware: ${AUDIT_GPU_HARDWARE}"
+  echo "- NVIDIA Driver: ${AUDIT_NVIDIA_DRIVER} (${AUDIT_NVIDIA_DRIVER_VER})"
+  echo "- CUDA Toolkit: ${AUDIT_CUDA_TOOLKIT} (${AUDIT_CUDA_VER})"
+  echo "- Spark RAPIDS JAR: ${AUDIT_SPARK_RAPIDS_JAR} (${AUDIT_SPARK_RAPIDS_JAR_FILE:-none})"
+  echo "- XGBoost GPU JAR: ${AUDIT_XGBOOST_JAR}"
+  echo "- YARN GPU Config: ${AUDIT_YARN_GPU_CONFIG}"
+  echo "- GPU Monitoring Agent: ${AUDIT_GPU_AGENT}"
+  echo "-----------------------------------"
+}
+
+PLAN_ACTIONS=()
+
+function plan_installation() {
+  echo "=== Phase 2: Generate Plan ==="
+  PLAN_ACTIONS=()
+
+  # Driver and CUDA toolkit installation needed if GPU hardware present but driver or CUDA toolkit missing
+  if [[ "${AUDIT_GPU_HARDWARE}" == "PRESENT" ]] && { [[ "${AUDIT_NVIDIA_DRIVER}" != "INSTALLED" ]] || [[ "${AUDIT_CUDA_TOOLKIT}" != "INSTALLED" ]]; }; then
+    PLAN_ACTIONS+=("INSTALL_NVIDIA_DRIVER")
+  else
+    echo "- Skip NVIDIA Driver & CUDA Toolkit installation (Driver: ${AUDIT_NVIDIA_DRIVER}, CUDA: ${AUDIT_CUDA_TOOLKIT})"
+  fi
+
+  # Spark RAPIDS JAR needed if missing
+  if [[ "${AUDIT_SPARK_RAPIDS_JAR}" != "INSTALLED" ]]; then
+    PLAN_ACTIONS+=("INSTALL_SPARK_RAPIDS_JAR")
+  fi
+
+  # XGBoost GPU JAR needed if missing (Assuming it's installed alongside RAPIDS in original)
+  # In original script, install_spark_rapids downloads both RAPIDS and XGBoost jars.
+  # Let's verify if we need separate actions or keep it as per original flow.
+  # The backup branch split them. Let's see if we can keep it simple first.
+  # If we look at original install_spark_rapids, it does both.
+  # Let's stick to original flow for now to be "incremental" and less disruptive.
+  # So INSTALL_SPARK_RAPIDS_JAR covers both in original script.
+
+  # YARN GPU configuration needed if missing
+  if [[ "${AUDIT_YARN_GPU_CONFIG}" != "CONFIGURED" ]]; then
+    PLAN_ACTIONS+=("CONFIGURE_YARN_GPU")
+  fi
+
+
+
+  echo "- Planned Actions:"
+  for action in "${PLAN_ACTIONS[@]}"; do
+    echo "  * ${action}"
+  done
+  echo "-----------------------------------"
+}
+
+function execute_plan() {
+  echo "=== Phase 3: Execute Plan ==="
+
+  if is_debian || is_ubuntu ; then
+    execute_with_retries "apt-get --allow-releaseinfo-change update"
+  fi
+
+  for action in "${PLAN_ACTIONS[@]}"; do
+    case "${action}" in
+      INSTALL_NVIDIA_DRIVER)
+        echo "Executing: INSTALL_NVIDIA_DRIVER"
+        install_nvidia_gpu_driver
+        ;;
+      INSTALL_SPARK_RAPIDS_JAR)
+        echo "Executing: INSTALL_SPARK_RAPIDS_JAR"
+        install_spark_rapids
+        ;;
+      CONFIGURE_YARN_GPU)
+        echo "Executing: CONFIGURE_YARN_GPU"
+        setup_gpu_yarn
+        configure_spark
+        ;;
+    esac
+  done
+}
+
 function main() {
+  audit_environment
+  plan_installation
   if is_debian && [[ $(echo "${DATAPROC_IMAGE_VERSION} <= 2.1" | bc -l) == 1 ]]; then
     remove_old_backports
   fi
   check_os_and_secure_boot
-  setup_gpu_yarn
-  if [[ "${RUNTIME}" == "SPARK" ]]; then
-    install_spark_rapids
-    configure_spark
-    echo "RAPIDS initialized with Spark runtime"
-  else
-    echo "Unsupported RAPIDS Runtime: ${RUNTIME}"
-    exit 1
-  fi
 
+  execute_plan
+
+  # Always ensure services are restarted/running if we did configure YARN
   for svc in resourcemanager nodemanager; do
     if [[ $(systemctl show hadoop-yarn-${svc}.service -p SubState --value) == 'running' ]]; then
       systemctl restart hadoop-yarn-${svc}.service
     fi
   done
+
   if is_debian || is_ubuntu ; then
     apt-get clean
   fi
